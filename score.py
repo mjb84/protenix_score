@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 import traceback
@@ -26,7 +27,6 @@ from protenix.data.infer_data_pipeline import InferenceDataset
 from protenix.utils.file_io import save_json
 from protenix.utils.torch_utils import round_values
 from protenix.utils.torch_utils import to_device
-from runner.batch_inference import get_default_runner
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +41,7 @@ class ScoreResult:
     prep_seconds: Optional[float] = None
     model_seconds: Optional[float] = None
     total_seconds: Optional[float] = None
+    per_sample_rows: Optional[List[dict]] = None
 
 
 def parse_seed_spec(value: Optional[str]) -> Optional[List[int]]:
@@ -498,7 +499,97 @@ def _configure_device(device: str) -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    if dst.exists():
+        return
+    _ensure_dir(dst.parent)
+    try:
+        os.link(src, dst)
+    except Exception:
+        shutil.copy2(src, dst)
+
+
+def _materialize_offline_root(args) -> Path:
+    model_name = str(getattr(args, "model_name", "protenix_base_default_v0.5.0"))
+    protenix_root_arg = getattr(args, "protenix_root_dir", None)
+    data_root_arg = getattr(args, "data_root_dir", None)
+    checkpoint_dir_arg = getattr(args, "checkpoint_dir", None)
+
+    env_protenix_root = os.environ.get("PROTENIX_ROOT_DIR")
+    env_data_root = os.environ.get("PROTENIX_DATA_ROOT_DIR")
+    env_ckpt_dir = os.environ.get("PROTENIX_CHECKPOINT_DIR")
+
+    protenix_root_raw = protenix_root_arg or env_protenix_root
+    data_root_raw = data_root_arg or env_data_root
+    checkpoint_root_raw = checkpoint_dir_arg or env_ckpt_dir
+
+    if protenix_root_raw:
+        root = Path(protenix_root_raw).expanduser().resolve()
+    elif data_root_raw:
+        data_path = Path(data_root_raw).expanduser().resolve()
+        root = data_path.parent if data_path.name == "common" else data_path
+    elif checkpoint_root_raw:
+        ckpt_path = Path(checkpoint_root_raw).expanduser().resolve()
+        root = ckpt_path.parent if ckpt_path.name == "checkpoint" else ckpt_path.parent
+    else:
+        root = (Path.home() / ".protenix_runtime").resolve()
+
+    common_dir = root / "common"
+    checkpoint_dir = root / "checkpoint"
+    _ensure_dir(common_dir)
+    _ensure_dir(checkpoint_dir)
+
+    if checkpoint_root_raw:
+        src_ckpt_dir = Path(checkpoint_root_raw).expanduser().resolve()
+        src_model = src_ckpt_dir / f"{model_name}.pt"
+        dst_model = checkpoint_dir / f"{model_name}.pt"
+        if src_model.exists() and not dst_model.exists():
+            _link_or_copy(src_model, dst_model)
+
+    source_common_dirs: List[Path] = []
+    for raw in (data_root_raw, protenix_root_raw):
+        if not raw:
+            continue
+        p = Path(raw).expanduser().resolve()
+        if p.is_dir():
+            source_common_dirs.append(p)
+            source_common_dirs.append(p / "common")
+
+    required_common_files = {
+        "components.cif": ["components.cif", "components.v20240608.cif"],
+        "components.cif.rdkit_mol.pkl": [
+            "components.cif.rdkit_mol.pkl",
+            "components.v20240608.cif.rdkit_mol.pkl",
+        ],
+        "clusters-by-entity-40.txt": ["clusters-by-entity-40.txt"],
+        "obsolete_release_date.csv": ["obsolete_release_date.csv"],
+        "obsolete_to_successor.json": ["obsolete_to_successor.json"],
+        "release_date_cache.json": ["release_date_cache.json"],
+    }
+
+    for dst_name, candidates in required_common_files.items():
+        dst = common_dir / dst_name
+        if dst.exists():
+            continue
+        for src_dir in source_common_dirs:
+            for cand in candidates:
+                src = src_dir / cand
+                if src.exists():
+                    _link_or_copy(src, dst)
+                    break
+            if dst.exists():
+                break
+
+    os.environ["PROTENIX_ROOT_DIR"] = str(root)
+    os.environ["PROTENIX_CHECKPOINT_DIR"] = str(checkpoint_dir)
+    os.environ.setdefault("PROTENIX_DATA_ROOT_DIR", str(common_dir))
+    return root
+
+
 def _load_runner(args) -> object:
+    _materialize_offline_root(args)
+    from runner.batch_inference import get_default_runner
+
     seeds = parse_seed_spec(getattr(args, "model_seeds", None)) or [101]
     runner = get_default_runner(
         seeds=seeds,
@@ -540,6 +631,12 @@ def _write_full(path: Path, full_data: dict) -> None:
 
     full_copy = get_clean_full_confidence(full_data.copy())
     save_json(full_copy, path, indent=4)
+
+
+def _write_summary_list(path: Path, summaries: List[dict]) -> None:
+    payload = [_json_safe(_safe_round_values(item.copy())) for item in summaries]
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=4)
 
 
 def _strip_templates_from_json(json_dict: dict) -> None:
@@ -984,28 +1081,34 @@ def _score_single(
                 )
     end_model = time.perf_counter()
 
-    summaries = pred_dict.get("summary_confidence", [])
-    if not summaries:
+    summaries_raw = pred_dict.get("summary_confidence", [])
+    if not summaries_raw:
         raise ValueError(f"{sample_name}: missing summary_confidence in prediction output")
+    summaries = [dict(item) for item in summaries_raw]
+    full_data_entries = pred_dict.get("full_data", []) if isinstance(pred_dict.get("full_data"), list) else []
+
+    if getattr(args, "write_ipsae", False) and full_data_entries:
+        target_chains = _parse_chain_list(args.target_chains) if getattr(args, "target_chains", None) else []
+        for idx, summary_item in enumerate(summaries):
+            if idx >= len(full_data_entries):
+                break
+            full_data_item = full_data_entries[idx]
+            if full_data_item is None:
+                continue
+            ipsae_metrics = _calculate_ipsae_metrics(
+                full_data=full_data_item,
+                chain_id_map=chain_id_map,
+                pae_cutoff=float(getattr(args, "ipsae_pae_cutoff", 10.0)),
+                target_source_chains=target_chains,
+            )
+            summary_item.update(ipsae_metrics)
+
     best_idx = max(
         range(len(summaries)),
         key=lambda i: float(summaries[i].get("ranking_score", 0.0)),
     )
     summary = summaries[best_idx]
-    full_data_raw = None
-    if "full_data" in pred_dict and isinstance(pred_dict["full_data"], list):
-        if best_idx < len(pred_dict["full_data"]):
-            full_data_raw = pred_dict["full_data"][best_idx]
-
-    if getattr(args, "write_ipsae", False) and full_data_raw is not None:
-        target_chains = _parse_chain_list(args.target_chains) if getattr(args, "target_chains", None) else []
-        ipsae_metrics = _calculate_ipsae_metrics(
-            full_data=full_data_raw,
-            chain_id_map=chain_id_map,
-            pae_cutoff=float(getattr(args, "ipsae_pae_cutoff", 10.0)),
-            target_source_chains=target_chains,
-        )
-        summary.update(ipsae_metrics)
+    full_data_raw = full_data_entries[best_idx] if best_idx < len(full_data_entries) else None
 
     full_data = full_data_raw if args.write_full_confidence else None
 
@@ -1013,9 +1116,24 @@ def _score_single(
 
     if args.write_summary_confidence:
         _write_summary(sample_out_dir / "summary_confidence.json", summary)
+        if bool(getattr(args, "predict_mode", False)) and bool(getattr(args, "write_all_samples", False)):
+            _write_summary_list(sample_out_dir / "summary_confidence_all.json", summaries)
+            for idx, summary_item in enumerate(summaries):
+                _write_summary(
+                    sample_out_dir / f"summary_confidence_sample_{idx:03d}.json",
+                    summary_item,
+                )
 
     if args.write_full_confidence and full_data is not None:
         _write_full(sample_out_dir / "full_confidence.json", full_data)
+        if bool(getattr(args, "predict_mode", False)) and bool(getattr(args, "write_all_samples", False)):
+            for idx, full_data_item in enumerate(full_data_entries):
+                if full_data_item is None:
+                    continue
+                _write_full(
+                    sample_out_dir / f"full_confidence_sample_{idx:03d}.json",
+                    full_data_item,
+                )
 
     if bool(getattr(args, "predict_mode", False)) and bool(getattr(args, "write_cif_model", True)):
         coords_tensor = pred_dict.get("coordinate")
@@ -1036,6 +1154,16 @@ def _score_single(
                     entity_poly_type=entity_poly,
                     pdb_id=sample_name,
                 )
+                if bool(getattr(args, "write_all_samples", False)):
+                    for idx in range(coords_tensor.shape[0]):
+                        model_cif_each = sample_out_dir / f"{sample_name}_sample_{idx:03d}_model.cif"
+                        save_structure_cif(
+                            atom_array=atom_array_internal,
+                            pred_coordinate=coords_tensor[idx].detach().cpu(),
+                            output_fpath=str(model_cif_each),
+                            entity_poly_type=entity_poly,
+                            pdb_id=f"{sample_name}_sample_{idx:03d}",
+                        )
 
     if cleanup_cif:
         try:
@@ -1055,6 +1183,23 @@ def _score_single(
         total_seconds,
     )
 
+    per_sample_rows = None
+    if bool(getattr(args, "predict_mode", False)) and bool(getattr(args, "write_all_samples", False)):
+        per_sample_rows = []
+        for idx, summary_item in enumerate(summaries):
+            per_sample_rows.append(
+                {
+                    "sample": f"{sample_name}__sample_{idx:03d}",
+                    "plddt": float(summary_item.get("plddt", 0.0)),
+                    "ptm": float(summary_item.get("ptm", 0.0)),
+                    "iptm": float(summary_item.get("iptm", 0.0)),
+                    "ranking_score": float(summary_item.get("ranking_score", 0.0)),
+                    "ipsae_interface_max": float(summary_item.get("ipsae_interface_max", 0.0)),
+                    "ipsae_target_to_binder": float(summary_item.get("ipsae_target_to_binder", 0.0)),
+                    "ipsae_binder_to_target": float(summary_item.get("ipsae_binder_to_target", 0.0)),
+                }
+            )
+
     return ScoreResult(
         sample_name=sample_name,
         summary=summary,
@@ -1063,6 +1208,7 @@ def _score_single(
         prep_seconds=prep_seconds,
         model_seconds=model_seconds,
         total_seconds=total_seconds,
+        per_sample_rows=per_sample_rows,
     )
 
 
@@ -1071,18 +1217,22 @@ def _write_aggregate_csv(results: List[ScoreResult], csv_path: Path) -> None:
         return
     rows = []
     for result in results:
+        if result.per_sample_rows:
+            rows.extend(result.per_sample_rows)
+            continue
         summary = result.summary
-        row = {
-            "sample": result.sample_name,
-            "plddt": float(summary.get("plddt", 0.0)),
-            "ptm": float(summary.get("ptm", 0.0)),
-            "iptm": float(summary.get("iptm", 0.0)),
-            "ranking_score": float(summary.get("ranking_score", 0.0)),
-            "ipsae_interface_max": float(summary.get("ipsae_interface_max", 0.0)),
-            "ipsae_target_to_binder": float(summary.get("ipsae_target_to_binder", 0.0)),
-            "ipsae_binder_to_target": float(summary.get("ipsae_binder_to_target", 0.0)),
-        }
-        rows.append(row)
+        rows.append(
+            {
+                "sample": result.sample_name,
+                "plddt": float(summary.get("plddt", 0.0)),
+                "ptm": float(summary.get("ptm", 0.0)),
+                "iptm": float(summary.get("iptm", 0.0)),
+                "ranking_score": float(summary.get("ranking_score", 0.0)),
+                "ipsae_interface_max": float(summary.get("ipsae_interface_max", 0.0)),
+                "ipsae_target_to_binder": float(summary.get("ipsae_target_to_binder", 0.0)),
+                "ipsae_binder_to_target": float(summary.get("ipsae_binder_to_target", 0.0)),
+            }
+        )
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))

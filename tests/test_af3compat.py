@@ -78,6 +78,45 @@ class TestAF3CompatHelpers(unittest.TestCase):
                 ],
             )
 
+    def test_aggregate_csv_per_sample_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "metrics.csv"
+            result = ScoreResult(
+                sample_name="x",
+                summary={},
+                full_data=None,
+                output_dir=Path(td),
+                per_sample_rows=[
+                    {
+                        "sample": "x__sample_000",
+                        "plddt": 10.0,
+                        "ptm": 1.0,
+                        "iptm": 2.0,
+                        "ranking_score": 3.0,
+                        "ipsae_interface_max": 4.0,
+                        "ipsae_target_to_binder": 5.0,
+                        "ipsae_binder_to_target": 6.0,
+                    },
+                    {
+                        "sample": "x__sample_001",
+                        "plddt": 11.0,
+                        "ptm": 1.1,
+                        "iptm": 2.1,
+                        "ranking_score": 3.1,
+                        "ipsae_interface_max": 4.1,
+                        "ipsae_target_to_binder": 5.1,
+                        "ipsae_binder_to_target": 6.1,
+                    },
+                ],
+            )
+            _write_aggregate_csv([result], out)
+            with out.open() as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["sample"], "x__sample_000")
+            self.assertEqual(rows[1]["sample"], "x__sample_001")
+
 
 if __name__ == "__main__":
     unittest.main()

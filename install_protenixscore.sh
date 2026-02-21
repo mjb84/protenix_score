@@ -104,6 +104,10 @@ if [[ -z "${CHECKPOINT_DIR}" ]]; then
   CHECKPOINT_DIR="${PROTENIX_DIR}/release_data/checkpoint"
 fi
 
+RUNTIME_ROOT="${PROTENIXSCORE_DIR}/protenix_runtime"
+RUNTIME_COMMON_DIR="${RUNTIME_ROOT}/common"
+RUNTIME_CHECKPOINT_DIR="${RUNTIME_ROOT}/checkpoint"
+
 if [[ ! -d "${PROTENIXSCORE_DIR}" ]]; then
   echo "ProtenixScore directory not found: ${PROTENIXSCORE_DIR}" >&2
   exit 1
@@ -290,6 +294,38 @@ else
   echo "Skipping CCD/data download"
 fi
 
+# Materialize a stable offline root compatible with full Protenix runtime expectations:
+#   <root>/checkpoint/<model>.pt
+#   <root>/common/components.cif (+ other metadata files)
+mkdir -p "${RUNTIME_COMMON_DIR}" "${RUNTIME_CHECKPOINT_DIR}"
+
+link_or_copy() {
+  local src="$1"
+  local dst="$2"
+  if [[ -f "${dst}" ]]; then
+    return
+  fi
+  mkdir -p "$(dirname "${dst}")"
+  ln "${src}" "${dst}" 2>/dev/null || cp -f "${src}" "${dst}"
+}
+
+if [[ -f "${CHECKPOINT_DIR}/${MODEL_NAME}.pt" ]]; then
+  link_or_copy "${CHECKPOINT_DIR}/${MODEL_NAME}.pt" "${RUNTIME_CHECKPOINT_DIR}/${MODEL_NAME}.pt"
+fi
+
+# Map versioned installer filenames to canonical Protenix runtime filenames.
+if [[ -f "${DATA_DIR}/components.v20240608.cif" ]]; then
+  link_or_copy "${DATA_DIR}/components.v20240608.cif" "${RUNTIME_COMMON_DIR}/components.cif"
+fi
+if [[ -f "${DATA_DIR}/components.v20240608.cif.rdkit_mol.pkl" ]]; then
+  link_or_copy "${DATA_DIR}/components.v20240608.cif.rdkit_mol.pkl" "${RUNTIME_COMMON_DIR}/components.cif.rdkit_mol.pkl"
+fi
+for f in clusters-by-entity-40.txt obsolete_release_date.csv obsolete_to_successor.json release_date_cache.json; do
+  if [[ -f "${DATA_DIR}/${f}" ]]; then
+    link_or_copy "${DATA_DIR}/${f}" "${RUNTIME_COMMON_DIR}/${f}"
+  fi
+done
+
 # Write conda activation env vars if using conda
 if [[ ${NO_CONDA} -eq 0 ]]; then
   ACTIVATE_DIR="${CONDA_PREFIX}/etc/conda/activate.d"
@@ -297,22 +333,26 @@ if [[ ${NO_CONDA} -eq 0 ]]; then
   cat > "${ACTIVATE_DIR}/protenixscore.sh" <<EOF
 export PROTENIX_CHECKPOINT_DIR="${CHECKPOINT_DIR}"
 export PROTENIX_DATA_ROOT_DIR="${DATA_DIR}"
+export PROTENIX_ROOT_DIR="${RUNTIME_ROOT}"
 export LAYERNORM_TYPE="torch"
 EOF
   echo "Wrote env activation script to ${ACTIVATE_DIR}/protenixscore.sh"
 else
   export PROTENIX_CHECKPOINT_DIR="${CHECKPOINT_DIR}"
   export PROTENIX_DATA_ROOT_DIR="${DATA_DIR}"
+  export PROTENIX_ROOT_DIR="${RUNTIME_ROOT}"
   export LAYERNORM_TYPE="torch"
   echo "Set env vars for this shell:"
   echo "  PROTENIX_CHECKPOINT_DIR=${PROTENIX_CHECKPOINT_DIR}"
   echo "  PROTENIX_DATA_ROOT_DIR=${PROTENIX_DATA_ROOT_DIR}"
+  echo "  PROTENIX_ROOT_DIR=${PROTENIX_ROOT_DIR}"
   echo "  LAYERNORM_TYPE=${LAYERNORM_TYPE}"
   if [[ ${KAGGLE_MODE} -eq 1 ]]; then
     KAGGLE_ENV_FILE="${PROTENIXSCORE_DIR}/kaggle_env.sh"
     cat > "${KAGGLE_ENV_FILE}" <<EOF
 export PROTENIX_CHECKPOINT_DIR="${PROTENIX_CHECKPOINT_DIR}"
 export PROTENIX_DATA_ROOT_DIR="${PROTENIX_DATA_ROOT_DIR}"
+export PROTENIX_ROOT_DIR="${PROTENIX_ROOT_DIR}"
 export LAYERNORM_TYPE="${LAYERNORM_TYPE}"
 EOF
     echo "Wrote Kaggle env file: ${KAGGLE_ENV_FILE}"
@@ -320,6 +360,7 @@ EOF
     echo "  import os"
     echo "  os.environ['PROTENIX_CHECKPOINT_DIR'] = '${PROTENIX_CHECKPOINT_DIR}'"
     echo "  os.environ['PROTENIX_DATA_ROOT_DIR'] = '${PROTENIX_DATA_ROOT_DIR}'"
+    echo "  os.environ['PROTENIX_ROOT_DIR'] = '${PROTENIX_ROOT_DIR}'"
     echo "  os.environ['LAYERNORM_TYPE'] = 'torch'"
   fi
 fi

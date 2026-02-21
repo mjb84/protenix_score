@@ -146,6 +146,22 @@ def _pick_model_cif(sample_dir: Path, sample_name: str) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def _iter_export_cifs(sample_dir: Path, sample_name: str, write_all_samples: bool) -> list[tuple[str, Path]]:
+    items: dict[str, Path] = {}
+    best = _pick_model_cif(sample_dir, sample_name)
+    if best is not None:
+        items[sample_name] = best
+    if write_all_samples:
+        pattern = re.compile(rf"^{re.escape(sample_name)}_sample_(\d+)_model\.cif$")
+        for cif_path in sorted(sample_dir.glob(f"{sample_name}_sample_*_model.cif")):
+            match = pattern.match(cif_path.name)
+            if not match:
+                continue
+            idx = int(match.group(1))
+            items[f"{sample_name}__sample_{idx:03d}"] = cif_path
+    return sorted(items.items(), key=lambda kv: kv[0])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_pdb_dir", default=None)
@@ -166,10 +182,13 @@ def main() -> None:
     parser.add_argument("--diffusion_steps", type=int, default=200)
     parser.add_argument("--recycles", type=int, default=10)
     parser.add_argument("--checkpoint_dir", default=os.environ.get("PROTENIX_CHECKPOINT_DIR"))
+    parser.add_argument("--protenix_root_dir", default=os.environ.get("PROTENIX_ROOT_DIR"))
+    parser.add_argument("--data_root_dir", default=os.environ.get("PROTENIX_DATA_ROOT_DIR"))
     parser.add_argument("--model_name", default="protenix_base_default_v0.5.0")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="bf16")
     parser.add_argument("--write_cif_model", type=_str2bool, default=True)
+    parser.add_argument("--write_all_samples", type=_str2bool, default=False)
     parser.add_argument("--write_full_confidence", type=_str2bool, default=True)
     parser.add_argument("--write_summary_confidence", type=_str2bool, default=True)
     parser.add_argument("--write_ipsae", type=_str2bool, default=True)
@@ -280,6 +299,8 @@ def main() -> None:
         assembly_id=None,
         altloc="first",
         checkpoint_dir=args.checkpoint_dir,
+        protenix_root_dir=args.protenix_root_dir,
+        data_root_dir=args.data_root_dir,
         model_name=args.model_name,
         device=args.device,
         dtype=args.dtype,
@@ -296,6 +317,7 @@ def main() -> None:
         write_ipsae=bool(args.write_ipsae),
         ipsae_pae_cutoff=args.ipsae_pae_cutoff,
         write_cif_model=bool(args.write_cif_model),
+        write_all_samples=bool(args.write_all_samples),
         summary_format="json",
         aggregate_csv=str(output_dir / "metrics.csv"),
         overwrite=bool(args.overwrite),
@@ -319,10 +341,12 @@ def main() -> None:
             if not sample_dir.is_dir():
                 continue
             sample_name = sample_dir.name
-            model_cif = _pick_model_cif(sample_dir, sample_name)
-            if model_cif is None:
-                continue
-            _copy_or_link(model_cif, export_cif_dir / f"{sample_name}.cif")
+            for export_name, model_cif in _iter_export_cifs(
+                sample_dir=sample_dir,
+                sample_name=sample_name,
+                write_all_samples=bool(args.write_all_samples),
+            ):
+                _copy_or_link(model_cif, export_cif_dir / f"{export_name}.cif")
 
     if args.export_pdb_dir:
         export_pdb_dir = Path(args.export_pdb_dir).resolve()
@@ -331,12 +355,14 @@ def main() -> None:
             if not sample_dir.is_dir():
                 continue
             sample_name = sample_dir.name
-            model_cif = _pick_model_cif(sample_dir, sample_name)
-            if model_cif is None:
-                continue
-            pdb_path = export_pdb_dir / f"{sample_name}.pdb"
-            if not pdb_path.exists() and _convert_cif_to_pdb(model_cif, pdb_path) and offset_map:
-                _renumber_chain_with_offsets(pdb_path, args.target_chain, offset_map)
+            for export_name, model_cif in _iter_export_cifs(
+                sample_dir=sample_dir,
+                sample_name=sample_name,
+                write_all_samples=bool(args.write_all_samples),
+            ):
+                pdb_path = export_pdb_dir / f"{export_name}.pdb"
+                if not pdb_path.exists() and _convert_cif_to_pdb(model_cif, pdb_path) and offset_map:
+                    _renumber_chain_with_offsets(pdb_path, args.target_chain, offset_map)
 
 
 if __name__ == "__main__":

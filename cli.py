@@ -153,6 +153,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Protenix checkpoint directory (defaults to PROTENIX_CHECKPOINT_DIR)",
     )
     score.add_argument(
+        "--protenix_root_dir",
+        default=os.environ.get("PROTENIX_ROOT_DIR"),
+        help="Offline Protenix root directory with checkpoint/ and common/ subdirs.",
+    )
+    score.add_argument(
+        "--data_root_dir",
+        default=os.environ.get("PROTENIX_DATA_ROOT_DIR"),
+        help="Offline data/common cache directory (components/cluster/obsolete files).",
+    )
+    score.add_argument(
         "--model_name",
         default="protenix_base_default_v0.5.0",
         help="Protenix model name",
@@ -308,6 +318,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Protenix checkpoint directory (defaults to PROTENIX_CHECKPOINT_DIR)",
     )
     predict.add_argument(
+        "--protenix_root_dir",
+        default=os.environ.get("PROTENIX_ROOT_DIR"),
+        help="Offline Protenix root directory with checkpoint/ and common/ subdirs.",
+    )
+    predict.add_argument(
+        "--data_root_dir",
+        default=os.environ.get("PROTENIX_DATA_ROOT_DIR"),
+        help="Offline data/common cache directory (components/cluster/obsolete files).",
+    )
+    predict.add_argument(
         "--model_name",
         default="protenix_base_default_v0.5.0",
         help="Protenix model name",
@@ -343,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_str2bool,
         default=True,
         help="Write top ranked model CIF file (true/false). Default: true",
+    )
+    predict.add_argument(
+        "--write_all_samples",
+        type=_str2bool,
+        default=False,
+        help="Write all diffusion samples (confidence JSON + CIF) instead of top-only outputs.",
     )
     predict.add_argument("--summary_format", default="json", choices=["json", "csv"])
     predict.add_argument(
@@ -407,6 +433,8 @@ def _interactive_args() -> argparse.Namespace:
         assembly_id=None,
         altloc="first",
         checkpoint_dir=checkpoint_dir or None,
+        protenix_root_dir=os.environ.get("PROTENIX_ROOT_DIR"),
+        data_root_dir=os.environ.get("PROTENIX_DATA_ROOT_DIR"),
         model_name=model_name,
         device=device,
         dtype=dtype,
