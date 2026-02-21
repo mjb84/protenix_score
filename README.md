@@ -1,0 +1,237 @@
+# ProtenixScore
+
+This repo was inspired by AF3Score (https://github.com/Mingchenchen/AF3Score).
+
+Score existing protein structures (PDB or CIF) with the Protenix confidence
+head, without running diffusion. ProtenixScore is designed for fast, reproducible
+"score-only" evaluation of fixed coordinates and is suitable for batch pipelines.
+In practice it is typically ~2.5-3x faster than running the full Protenix
+inference pipeline when you only need confidence scoring. 
+
+Key features
+- Score-only mode: uses provided coordinates, no diffusion sampling.
+- PDB or CIF input, with automatic PDB -> CIF conversion.
+- Per-structure outputs plus an aggregate CSV summary.
+- MSA features enabled by default (single-sequence MSA is injected if not provided).
+- ipSAE metrics (AF3Score-style) computed from Protenix token-pair PAE.
+
+## Requirements
+
+- This repo checked out locally.
+- Pinned Protenix fork installed (use `install_protenixscore.sh`).
+- Python 3.11 environment with Protenix dependencies installed (conda or existing).
+- Protenix checkpoint + CCD/data cache (downloaded by the install script unless skipped).
+
+## Install (recommended)
+
+Clone this repo, then run the install script from the repo root:
+
+```bash
+git clone https://github.com/cytokineking/ProtenixScore
+cd protenixscore
+./install_protenixscore.sh
+```
+
+This clones the pinned Protenix fork (modified to support score-only mode), installs dependencies, and downloads
+weights/CCD data unless skipped. It also wires up `PROTENIX_CHECKPOINT_DIR` and
+`PROTENIX_DATA_ROOT_DIR` (conda activation or printed for manual export).
+See `./install_protenixscore.sh --help` for options.
+
+By default, `install_protenixscore.sh` pins the Protenix fork to a specific git commit for reproducibility.
+Override with `--commit <sha>` (or pass an empty commit string to follow `--branch`).
+The installer now also validates predict/refold runtime readiness (imports, checkpoint/data dirs)
+unless you pass `--skip-validation`.
+
+### Kaggle install
+
+In a Kaggle notebook, use the installer in Kaggle mode (no conda required):
+
+```bash
+git clone https://github.com/cytokineking/ProtenixScore
+cd ProtenixScore
+bash ./install_protenixscore.sh --kaggle
+```
+
+If your Kaggle image is CPU-only, add `--cpu`.
+
+In Python cells, set env vars for the current session before scoring:
+
+```python
+import os
+os.environ["PROTENIX_CHECKPOINT_DIR"] = "/kaggle/working/ProtenixScore/Protenix_fork/release_data/checkpoint"
+os.environ["PROTENIX_DATA_ROOT_DIR"] = "/kaggle/working/ProtenixScore/protenix_data"
+os.environ["LAYERNORM_TYPE"] = "torch"
+```
+
+Protenix original repository:
+https://github.com/bytedance/Protenix
+
+Pinned fork used by the install script:
+https://github.com/cytokineking/Protenix
+
+## Quickstart
+
+After installing (and activating the environment if you used conda), validate
+the installation using the included test PDBs (single file):
+
+```bash
+python -m protenixscore score \
+  --input ./test_pdbs/1_PDL1-freebindcraft-2_l141_s788784_mpnn6_model1.pdb \
+  --output ./score_out
+```
+
+Validate the installation using the included test PDBs (entire folder):
+
+```bash
+python -m protenixscore score \
+  --input ./test_pdbs \
+  --output ./score_out \
+  --recursive
+```
+
+Interactive guided mode:
+
+```bash
+python -m protenixscore interactive
+```
+
+Predict/refold mode (diffusion inference with Protenix):
+
+```bash
+python -m protenixscore predict \
+  --input ./test_pdbs \
+  --output ./predict_out \
+  --recursive \
+  --num_samples 2 \
+  --model_seeds 101,102
+```
+
+AF3-compatible wrapper (drop-in orchestration contract):
+
+```bash
+python ./scripts/run_protenixscore_af3compat.py \
+  --input_pdb_dir ./test_pdbs \
+  --output_dir ./af3compat_out \
+  --write_cif_model true \
+  --export_pdb_dir ./af3compat_out/pdbs \
+  --export_cif_dir ./af3compat_out/cifs
+```
+
+## Outputs
+
+For each input structure `sample`, outputs are written to:
+
+```
+<output>/
+  summary.csv
+  failed_records.txt
+  <sample>/
+    summary_confidence.json
+    full_confidence.json
+    chain_id_map.json
+    missing_atoms.json   (only if missing atoms were detected)
+```
+
+Notes:
+- `summary.csv` is written when at least one structure is successfully scored.
+- `failed_records.txt` is written only if one or more inputs fail.
+- `chain_id_map.json` records the mapping between Protenix internal chain IDs
+  and source chain IDs.
+- `missing_atoms.json` is written when coordinates are missing and a fallback
+  policy is used.
+
+### ipSAE (Interface Predicted Structural Alignment Error)
+
+ProtenixScore computes ipSAE using the same definition as AF3Score's `calculate_ipsae`
+(inspired by the `IPSAE` script family), but using Protenix's `token_pair_pae`
+from `full_confidence.json` instead of AlphaFold JSON outputs.
+
+Definition (directional, chain1 -> chain2):
+- Let `PAE(i,j)` be the token-pair PAE from chain1 token `i` to chain2 token `j`.
+- Keep only "valid" interface pairs where `PAE(i,j) < pae_cutoff` (default `10.0` Angstrom).
+- For each chain1 token `i`, compute `n0res(i) = count_j valid(i,j)`.
+- Compute a TM-score-like normalization per token:
+  `d0(i) = max(1.0, 1.24 * cbrt(max(27, n0res(i)) - 15) - 1.8)`.
+- Convert PAE to a PTM-like score:
+  `ptm(i,j) = 1 / (1 + (PAE(i,j) / d0(i))^2)`.
+- Per-token ipSAE is the mean `ptm(i,j)` over valid `j` (0 if no valid pairs).
+- Final ipSAE for the directional chain pair is `max_i per_token_ipSAE(i)`.
+
+Outputs:
+- `summary_confidence.json` includes:
+  - `ipsae_by_chain_pair`: map of directional chain-pair scores, keyed by source chain IDs (e.g. `A_B`, `B_A`).
+  - `ipsae_target_to_binder`, `ipsae_binder_to_target`, `ipsae_interface_max` when `--target_chains` is provided.
+- `summary.csv` includes `ipsae_interface_max`, `ipsae_target_to_binder`, `ipsae_binder_to_target`.
+
+Which ipSAE metric should you use?
+- For the common "many binders vs one target" setup (you pass `--target_chains A`),
+  the binder-focused score is `ipsae_binder_to_target` (direction: binder -> target).
+
+## Common options
+
+- `--model_name` (default: `protenix_base_default_v0.5.0`)
+- `--checkpoint_dir` (optional, overrides default checkpoint location)
+- `--device` (`cpu|cuda:N|auto`, default: `auto`)
+- `--dtype` (`fp32|bf16|fp16`, default: `bf16`)
+- `--use_msa` (default: true; injects single-sequence MSA if none provided)
+- `--msa_path` (optional; use precomputed MSA instead of dummy)
+- `--chain_sequence` (optional; override chain sequences, format `A=SEQUENCE`, repeatable)
+- `--target_chains` (optional; comma-separated chain IDs to treat as target)
+- `--target_chain_sequences` (optional; FASTA of target sequences to match by sequence)
+- `--target_msa_path` (optional; precomputed target MSAs in entity_1/, entity_2/, ...)
+- `--binder_msa_mode` (default: single; single or none)
+- `--msa_cache_dir` (optional; cache target MSAs by sequence hash)
+- `--msa_source` (none|colabfold; how to generate target MSAs when cache miss)
+- `--msa_host` (ColabFold server URL)
+- `--msa_use_env` / `--msa_use_filter` (ColabFold controls, default true)
+- `--msa_cache_refresh` (force re-fetch MSAs even if cached)
+- `--use_esm` (optional)
+- `--convert_pdb_to_cif` (always on for PDB input)
+- `--missing_atom_policy` (`reference|zero|error`, default: `reference`)
+- `--max_tokens` / `--max_atoms` (optional safety caps)
+- `--write_ipsae` (true/false, default: true)
+- `--ipsae_pae_cutoff` (default: 10.0 Angstrom)
+
+## How it works (high level)
+
+1. Parse PDB/CIF (PDB is always converted to CIF).
+2. Extract per-chain sequences from coordinates (or override via `--chain_sequence`).
+3. Build Protenix features from CIF.
+4. Map source atom coordinates to Protenix atom ordering.
+5. Run Protenix confidence head with the provided coordinates.
+
+## Target/binder batch workflow (recommended for many binders vs one target)
+
+If you are scoring many binders against a fixed target, reuse a single target MSA
+and use single-sequence MSAs for binders:
+
+```bash
+python -m protenixscore score \
+  --input ./ranked \
+  --output ./scores \
+  --recursive \
+  --target_chains A \
+  --binder_msa_mode single \
+  --msa_cache_dir ./msa_cache \
+  --msa_source colabfold
+```
+
+Notes:
+- Target MSAs are cached by sequence hash under `--msa_cache_dir`.
+- Binder chains are kept in single-sequence mode for speed.
+
+MSA notes:
+- Protenix confidence scoring relies on MSAs; use precomputed MSAs or enable fetching
+  so the target chain has a real MSA.
+- Use `--msa_path` to point to precomputed MSAs laid out as `entity_1/`, `entity_2/`, etc.
+  For batch runs you can also provide per-sample subfolders under `/path/to/msa/<sample_name>/entity_*`.
+- When you set `--target_chains` (or `--target_chain_sequences`) and do not provide
+  `--target_msa_path` / `--msa_cache_dir`, ProtenixScore defaults to fetching target
+  MSAs from the ColabFold server and caches them under `<output>/msa_cache`.
+
+## Troubleshooting
+
+- If you see missing atom warnings, consider switching
+  `--missing_atom_policy` to `error` to fail fast.
+- If you hit device issues, try `--device cpu` to verify your setup.
+- If checkpoints are not found, specify `--checkpoint_dir`.
